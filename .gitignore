@@ -1,0 +1,16 @@
+# Локальные значения секретов — в проде берутся из GitHub Secrets.
+.env
+.env.local
+.env.*.local
+
+# Данные и состояние docker-mailserver — не коммитим (бэкап идёт отдельно).
+docker-data/
+!docker-data/.gitkeep
+
+# Логи/временные файлы
+*.log
+*.tmp
+
+# IDE
+.idea/
+.vscode/

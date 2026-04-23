@@ -1,0 +1,102 @@
+# ============================================================================
+# CI/CD — раскатка wb-helper-mailserver на сервер lion
+# ----------------------------------------------------------------------------
+# Триггер: push в main с изменениями в compose/configs.
+# Сценарий:
+#   1) SSH на lion под деплой-пользователем.
+#   2) git pull в /opt/wb-helper-mailserver.
+#   3) Записать .env из GitHub Secrets.
+#   4) docker compose pull && up -d.
+#   5) Health-check: ждём, пока контейнер перейдёт в состояние healthy
+#      (docker-mailserver собирает healthcheck через ss на tcp:25).
+#
+# Все секреты — в Repository Settings → Secrets and variables → Actions.
+# ============================================================================
+
+name: deploy-mailserver
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docker-compose.yml'
+      - 'mailserver.env'
+      - 'config/**'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-mailserver
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          port: ${{ secrets.SSH_PORT }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+
+            DEPLOY_PATH="${{ secrets.MAIL_DEPLOY_PATH }}"
+
+            # Git 2.35+ ругается на "dubious ownership" в non-login SSH-сессиях,
+            # даже если UID совпадает с владельцем .git. Явно помечаем путь безопасным.
+            git config --global --add safe.directory "$DEPLOY_PATH"
+
+            cd "$DEPLOY_PATH"
+
+            echo "::group::git sync"
+            git fetch --prune origin
+            git reset --hard origin/main
+            echo "::endgroup::"
+
+            echo "::group::write .env"
+            umask 077
+            cat > .env <<EOF
+            MAIL_HOSTNAME=${{ secrets.MAIL_HOSTNAME }}
+            POSTMASTER_ADDRESS=${{ secrets.POSTMASTER_ADDRESS }}
+            MAIL_BIND_IP=${{ secrets.MAIL_BIND_IP }}
+            SSL_TYPE=${{ secrets.SSL_TYPE }}
+            EOF
+            echo "::endgroup::"
+
+            echo "::group::docker compose pull"
+            docker compose pull
+            echo "::endgroup::"
+
+            echo "::group::docker compose up -d"
+            docker compose up -d --remove-orphans
+            echo "::endgroup::"
+
+            echo "::group::wait for mailserver healthy"
+            # docker-mailserver стартует 30-60 сек (spamassassin+amavis прогреваются).
+            # Ждём до 3 минут, пока контейнер не станет healthy.
+            CONTAINER="wb-mailserver"
+            for i in $(seq 1 90); do
+              status=$(docker inspect -f '{{.State.Health.Status}}' "$CONTAINER" 2>/dev/null || echo "missing")
+              if [ "$status" = "healthy" ]; then
+                echo "mailserver healthy (attempt $i)"
+                break
+              fi
+              echo "attempt $i: status '$status', retrying..."
+              sleep 2
+            done
+            if [ "$status" != "healthy" ]; then
+              echo "::error::mailserver did not become healthy"
+              docker compose ps
+              docker compose logs --tail=100 mailserver
+              exit 1
+            fi
+            echo "::endgroup::"
+
+            echo "::group::docker compose ps"
+            docker compose ps
+            echo "::endgroup::"

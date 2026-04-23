@@ -1,0 +1,79 @@
+# ============================================================================
+# wb-helper-mailserver — SMTP/IMAP для домена wb-helper.tech
+# ----------------------------------------------------------------------------
+# Основан на docker-mailserver (https://github.com/docker-mailserver/docker-mailserver).
+# Разворачивается на сервере lion (192.168.1.4) через GitHub Actions.
+#
+# Отличия от wb-helper-infra:
+#   • Порты (25/465/587/993) биндятся на 0.0.0.0 — сервис смотрит наружу
+#     напрямую, не через Apache reverse proxy (он умеет только HTTP(S)).
+#   • TLS — не через Apache, а собственный: SSL_TYPE=letsencrypt, сертификаты
+#     монтируются из /etc/letsencrypt на хосте (certbot поддерживается отдельно).
+#   • Конфиг (аккаунты/алиасы/DKIM) лежит в ./config — версионируется в git
+#     (пароли — хеши, не plaintext; аккаунты создаёт ops через setup.sh).
+#
+# Первичная настройка аккаунта:
+#   docker exec -it wb-mailserver setup email add postmaster@wb-helper.tech
+#   docker exec -it wb-mailserver setup config dkim
+#
+# DNS-записи (A / MX / SPF / DKIM / DMARC / PTR) — см. README.md.
+# ============================================================================
+
+networks:
+  wb-mailserver:
+    name: wb-mailserver
+    driver: bridge
+
+services:
+  mailserver:
+    image: ghcr.io/docker-mailserver/docker-mailserver:14.0
+    container_name: wb-mailserver
+    hostname: ${MAIL_HOSTNAME}
+    restart: unless-stopped
+    networks: [wb-mailserver]
+
+    # Порты наружу. MAIL_BIND_IP=0.0.0.0 по умолчанию — если мэйл NAT-ится с
+    # отдельного публичного IP, подставь его в .env, чтобы не светить на LAN.
+    ports:
+      - "${MAIL_BIND_IP:-0.0.0.0}:25:25"     # SMTP (приём почты с других MTA)
+      - "${MAIL_BIND_IP:-0.0.0.0}:465:465"   # SMTPS (submission c implicit TLS)
+      - "${MAIL_BIND_IP:-0.0.0.0}:587:587"   # Submission (STARTTLS)
+      - "${MAIL_BIND_IP:-0.0.0.0}:993:993"   # IMAPS
+      # 143 (IMAP STARTTLS) и 110/995 (POP3) выключены в mailserver.env —
+      # если понадобятся, расскомментировать и там, и здесь.
+
+    env_file:
+      - ./mailserver.env
+    environment:
+      # Переменные, которые удобнее держать в .env (секреты/домен), а не в
+      # версионируемом mailserver.env. Пробрасываются из GitHub Secrets.
+      POSTMASTER_ADDRESS: ${POSTMASTER_ADDRESS}
+      SSL_TYPE: ${SSL_TYPE:-letsencrypt}
+      SSL_DOMAIN: ${MAIL_HOSTNAME}
+
+    volumes:
+      # Данные писем, состояние и логи — в bind mount на хосте, чтобы пережить
+      # пересоздание контейнера и были видны бэкапу.
+      - ./docker-data/dms/mail-data/:/var/mail/
+      - ./docker-data/dms/mail-state/:/var/mail-state/
+      - ./docker-data/dms/mail-logs/:/var/log/mail/
+      # Конфиг docker-mailserver (postfix-accounts.cf, DKIM-ключи, алиасы).
+      # Лежит в git; пароли — хеши, не plaintext.
+      - ./config/:/tmp/docker-mailserver/
+      # Let's Encrypt сертификаты (certbot на хосте обновляет их независимо).
+      # Структура: /etc/letsencrypt/live/<MAIL_HOSTNAME>/{fullchain,privkey}.pem
+      - /etc/letsencrypt/:/etc/letsencrypt/:ro
+      # Часовой пояс — с хоста.
+      - /etc/localtime:/etc/localtime:ro
+
+    # docker-mailserver сам собирает healthcheck: postfix status.
+    healthcheck:
+      test: ["CMD", "ss", "--listening", "--tcp", "|", "grep", "-P", "LISTEN.+:smtp"]
+      timeout: 3s
+      retries: 0
+
+    # Капабилити нужны postfix/dovecot для привилегированных операций
+    # (отдача прав maildrop, chroot и т.п.). Ограничены только тем, что нужно.
+    cap_add:
+      - NET_ADMIN
+      - SYS_PTRACE
