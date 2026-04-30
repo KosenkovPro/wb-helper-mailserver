@@ -66,11 +66,16 @@ services:
       # Часовой пояс — с хоста.
       - /etc/localtime:/etc/localtime:ro
 
-    # docker-mailserver сам собирает healthcheck: postfix status.
+    # Healthcheck: проверяем, что postfix слушает 25-й порт.
+    # ВАЖНО: используем форму CMD-SHELL — иначе pipe не работает (json-array
+    # форма не запускает шелл, "|" уходит как arg в ss).
+    # start_period=90s — даёт DMS время прогреться (spamassassin/amavis).
     healthcheck:
-      test: ["CMD", "ss", "--listening", "--tcp", "|", "grep", "-P", "LISTEN.+:smtp"]
-      timeout: 3s
-      retries: 0
+      test: ["CMD-SHELL", "ss -lnt | grep -q ':25 '"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
 
     # Капабилити нужны postfix/dovecot для привилегированных операций
     # (отдача прав maildrop, chroot и т.п.). Ограничены только тем, что нужно.
