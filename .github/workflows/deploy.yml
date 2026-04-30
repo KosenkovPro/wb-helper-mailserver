@@ -1,10 +1,10 @@
 # ============================================================================
-# CI/CD — раскатка wb-helper-mailserver на сервер lion
+# CI/CD — раскатка wb-helper-mailserver на сервер БД (192.168.1.10)
 # ----------------------------------------------------------------------------
 # Триггер: push в main с изменениями в compose/configs.
 # Сценарий:
-#   1) SSH на lion под деплой-пользователем.
-#   2) git pull в /opt/wb-helper-mailserver.
+#   1) SSH на сервер БД (внутр. IP 192.168.1.10, наружу через NAT).
+#   2) git fetch + reset --hard origin/main в ${MAIL_DEPLOY_PATH}.
 #   3) Записать .env из GitHub Secrets.
 #   4) docker compose pull && up -d.
 #   5) Health-check: ждём, пока контейнер перейдёт в состояние healthy

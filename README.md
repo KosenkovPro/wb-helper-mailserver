@@ -2,7 +2,7 @@
 
 Почтовый сервер для домена `wb-helper.tech` на базе [docker-mailserver](https://github.com/docker-mailserver/docker-mailserver) (postfix + dovecot + rspamd/spamassassin + opendkim + fail2ban).
 
-Разворачивается на сервере `lion` (192.168.1.4) через GitHub Actions. В отличие от `wb-helper-infra`, публичный доступ — **без** Apache reverse proxy: SMTP/IMAP — это не HTTP, порты 25/465/587/993 проброшены наружу напрямую.
+Разворачивается **на сервере БД `192.168.1.10`** через **GitHub Actions**. Публичный доступ — без Apache reverse proxy: SMTP/IMAP — это не HTTP, порты 25/465/587/993 проброшены наружу напрямую.
 
 ## Состав
 
@@ -15,123 +15,183 @@
 
 POP3 и незашифрованный IMAP (143) отключены в `mailserver.env`.
 
-## Предусловия перед деплоем
+---
 
-### 1. DNS (на DNS-провайдере домена)
+## 1. DNS — что указать у регистратора домена
+
+> Замени `wb-helper.tech` на свой домен и `<PUBLIC_IP>` на публичный IP сервера БД (или IP, на который мэйл проброшен снаружи).
+
+| # | Тип | Имя (host) | Значение | TTL | Зачем |
+|---|---|---|---|---|---|
+| 1 | `A` | `mail` | `<PUBLIC_IP>` | 3600 | A-запись хоста MX |
+| 2 | `MX` | `@` | `mail.wb-helper.tech.` приоритет `10` | 3600 | Куда другие MTA шлют почту для домена |
+| 3 | `TXT` | `@` | `v=spf1 mx -all` | 3600 | SPF — разрешает отправку только из MX-хоста |
+| 4 | `TXT` | `_dmarc` | см. ниже (раздел про «недопустимые символы») | 3600 | DMARC — политика для писем без SPF/DKIM |
+| 5 | `TXT` | `mail._domainkey` | (значение появится после **первого деплоя**, шаг 4) | 3600 | DKIM — подпись писем приватным ключом |
+
+### PTR (reverse DNS) — у **хостера/провайдера IP**, не у регистратора
 
 | Тип | Имя | Значение |
 |---|---|---|
-| `A` | `mail.wb-helper.tech` | публичный IP сервера lion |
-| `MX` | `wb-helper.tech` | `10 mail.wb-helper.tech` |
-| `TXT` | `wb-helper.tech` | `v=spf1 mx -all` |
-| `TXT` | `_dmarc.wb-helper.tech` | `v=DMARC1; p=quarantine; rua=mailto:postmaster@wb-helper.tech` |
-| `TXT` | `mail._domainkey.wb-helper.tech` | DKIM-ключ (сгенерируется на шаге «первичная настройка») |
-| `PTR` | (reverse) | `mail.wb-helper.tech` (настраивается у хостера!) |
+| `PTR` | reverse `<PUBLIC_IP>` (`in-addr.arpa`) | `mail.wb-helper.tech.` |
 
-PTR **обязателен** — без него Gmail/Yandex будут бить письма в спам или отклонять.
+**PTR обязателен.** Без него Gmail/Yandex/Mail.ru отбрасывают письма с `550 5.7.1`. Настраивается в личном кабинете VPS.
 
-### 2. Firewall / port-forwarding на роутере
+### 1.1. Ошибка «текст содержит недопустимые символы» при добавлении `_dmarc`
 
-Прокинуть на lion (192.168.1.4) TCP: `25`, `465`, `587`, `993`. Если используется отдельный публичный IP — укажи его в `MAIL_BIND_IP`.
+Это особенность UI многих регистраторов (REG.RU, RU-CENTER, Beget, GoDaddy и др.) — они валидируют поле «значение TXT» и спотыкаются о `;`, `:`, `@` или пробелы. Сама запись DMARC **обязана** содержать `;` (RFC 7489), поэтому правильное решение — обернуть значение в **двойные кавычки**, тогда UI пропускает строку как единый литерал.
 
-### 3. TLS-сертификат
+**Пробуй варианты в таком порядке** — какой проглотит, тот и используй (DNS-сервер всё равно отдаёт байты как есть):
 
-На lion должен стоять `certbot` и быть выпущен сертификат:
+```
+# 1. Минимальный DMARC в кавычках — рекомендую начать с него:
+"v=DMARC1; p=none; rua=mailto:postmaster@wb-helper.tech"
+
+# 2. Без кавычек, минимальный (если UI кавычки не любит):
+v=DMARC1; p=none; rua=mailto:postmaster@wb-helper.tech
+
+# 3. Если ругается на @ в rua — на старте можно вообще без rua:
+v=DMARC1; p=none
+
+# 4. Если ругается на ; — у некоторых российских регистраторов есть отдельная
+#    форма "DMARC-запись" в админке (REG.RU: «DNS → Запись → DMARC»),
+#    где поля заполняются по одному и ; ставится автоматически.
+```
+
+Почему `p=none` на старте, а не `p=quarantine`: первые 1–2 недели смотришь rua-отчёты, убеждаешься, что собственная почта проходит, и только потом ужесточаешь до `quarantine`, потом `reject`. Иначе свои же письма уйдут в спам у получателей.
+
+**Полезно:** валидаторы DMARC — https://mxtoolbox.com/dmarc.aspx или https://dmarcian.com/dmarc-inspector/ — покажут, что DNS реально вернул, после того как запись применится (TTL).
+
+### 1.2. Проверка после применения
 
 ```bash
-sudo apt install certbot
+dig +short MX wb-helper.tech                  # → 10 mail.wb-helper.tech.
+dig +short A mail.wb-helper.tech              # → <PUBLIC_IP>
+dig +short TXT wb-helper.tech                 # → "v=spf1 mx -all"
+dig +short TXT _dmarc.wb-helper.tech          # → "v=DMARC1; p=none; ..."
+dig +short -x <PUBLIC_IP>                     # → mail.wb-helper.tech. (PTR)
+```
+
+Финальная проверка репутации — отправить письмо на https://www.mail-tester.com/, цель — **10/10**.
+
+---
+
+## 2. GitHub Actions — что указать в проекте
+
+Пайплайн `.github/workflows/deploy.yml` уже в репо. Триггерится по `push` в `main` с изменениями в `docker-compose.yml`, `mailserver.env`, `config/**` (или вручную из вкладки **Actions** через `workflow_dispatch`).
+
+### Secrets (Settings → Secrets and variables → Actions → New repository secret)
+
+| Имя | Значение / пример |
+|---|---|
+| `SSH_HOST` | `95.165.9.178` — внешний IP/хост (NAT-проброс на 192.168.1.10) |
+| `SSH_PORT` | `49154` — внешний порт, проброшен на `192.168.1.10:22` |
+| `SSH_USER` | `deploy` — деплой-пользователь на сервере БД |
+| `SSH_PRIVATE_KEY` | приватный ключ ed25519/rsa в PEM, **с переводами строк** |
+| `MAIL_DEPLOY_PATH` | `/opt/wb-helper-mailserver` |
+| `MAIL_HOSTNAME` | `mail.wb-helper.tech` |
+| `POSTMASTER_ADDRESS` | `postmaster@wb-helper.tech` |
+| `MAIL_BIND_IP` | `0.0.0.0` (или конкретный публичный IP) |
+| `SSL_TYPE` | `letsencrypt` |
+
+> GitHub Secrets корректно сохраняют многострочные значения — приватный ключ вставляй целиком, включая `-----BEGIN OPENSSH PRIVATE KEY-----` и `-----END OPENSSH PRIVATE KEY-----`.
+
+### Подготовка сервера БД (192.168.1.10) один раз
+
+```bash
+# 1. Деплой-пользователь и каталог
+sudo useradd -m -s /bin/bash deploy
+sudo usermod -aG docker deploy
+sudo mkdir -p /opt/wb-helper-mailserver
+sudo chown deploy:deploy /opt/wb-helper-mailserver
+
+# 2. SSH-ключ для CI (на машине разработчика)
+ssh-keygen -t ed25519 -f ~/.ssh/wb-mailserver-deploy -N ""
+ssh-copy-id -i ~/.ssh/wb-mailserver-deploy.pub -p 49154 deploy@<PUBLIC_IP>
+# Содержимое ~/.ssh/wb-mailserver-deploy → в GitHub Secret SSH_PRIVATE_KEY
+
+# 3. Клон репо в /opt
+sudo -u deploy git clone git@github.com:<org>/wb-helper-mailserver.git /opt/wb-helper-mailserver
+
+# 4. Certbot для TLS (см. раздел 3)
+sudo apt install -y certbot
 sudo certbot certonly --standalone -d mail.wb-helper.tech
-# cert: /etc/letsencrypt/live/mail.wb-helper.tech/{fullchain,privkey}.pem
+sudo systemctl enable --now certbot.timer
+
+# 5. Прокинуть на роутере TCP 25/465/587/993 на 192.168.1.10
 ```
 
-docker-mailserver подхватывает их автоматически при `SSL_TYPE=letsencrypt`. Автообновление certbot → `systemctl enable --now certbot.timer`.
+После этого первый push в `main` (или ручной `workflow_dispatch`) развернёт сервис.
 
-## Локальный запуск
+---
+
+## 3. TLS-сертификат
+
+`SSL_TYPE=letsencrypt` — docker-mailserver сам подхватывает `/etc/letsencrypt/live/${MAIL_HOSTNAME}/{fullchain,privkey}.pem`. Сертификат выпускает **certbot на хосте**, не контейнер. Автообновление через `certbot.timer`.
+
+> На время выпуска cert порт `80` должен быть свободен (или используй DNS-01 challenge).
+
+---
+
+## 4. Первичная настройка после первого успешного деплоя
 
 ```bash
-cp .env.example .env   # заполнить MAIL_HOSTNAME, POSTMASTER_ADDRESS
-# Для локалки проще SSL_TYPE=self-signed или выключить TLS в mailserver.env
-docker compose up -d
-docker compose logs -f mailserver
-```
-
-## Первичная настройка (на сервере, после первого деплоя)
-
-```bash
+ssh -p 49154 deploy@<PUBLIC_IP>
 cd /opt/wb-helper-mailserver
 
-# 1. Создать ящик (пароль интерактивно)
+# 1. Создать ящик postmaster
 docker exec -it wb-mailserver setup email add postmaster@wb-helper.tech
+# → введи пароль; хеш запишется в config/postfix-accounts.cf
 
 # 2. Сгенерировать DKIM-ключ
 docker exec -it wb-mailserver setup config dkim
 
-# 3. Опубликовать DKIM-запись в DNS.
+# 3. Получить значение DKIM TXT для DNS
 cat config/opendkim/keys/wb-helper.tech/mail.txt
-# → скопировать TXT-значение в DNS как mail._domainkey.wb-helper.tech
+# → скопировать всё, что в скобках, в одну строку, и добавить как
+#   TXT mail._domainkey.wb-helper.tech = "v=DKIM1; k=rsa; p=MIIBIjAN..."
 
-# 4. Проверить работу
-docker exec -it wb-mailserver setup debug fetchmail
-docker exec -it wb-mailserver postconf -n | head
-```
-
-Созданные `config/postfix-accounts.cf` и `config/opendkim/…` нужно **закоммитить в git** (пароли там хранятся в виде SHA512-хешей, DKIM private key — помечен `.gitignore` если не хотим его в git; по умолчанию docker-mailserver кладёт приватник рядом — для прод-безопасности его лучше не пушить).
-
-> **Важно.** Приватные DKIM-ключи (`config/opendkim/keys/**/*.private`) коммитить в публичный репозиторий не стоит. Либо держи репо приватным, либо добавь их в `.gitignore` и переноси отдельно (через secret-хранилище).
-
-## Деплой
-
-`.github/workflows/deploy.yml` триггерится по `push` в `main` с изменениями в `docker-compose.yml`, `mailserver.env`, `config/**`:
-
-1. SSH на `lion` под деплой-пользователем.
-2. `git reset --hard origin/main` в `${MAIL_DEPLOY_PATH}` (обычно `/opt/wb-helper-mailserver`).
-3. Запись `.env` из GitHub Secrets.
-4. `docker compose pull && up -d --remove-orphans`.
-5. Ждём статус контейнера `healthy` (до 3 минут — spamassassin/amavis долго прогреваются).
-
-### GitHub Secrets
-
-| Имя | Значение | Пример |
-|---|---|---|
-| `SSH_HOST` | Внешний IP сервера | `95.165.9.178` |
-| `SSH_PORT` | Проброс до `lion:22` | `49154` |
-| `SSH_USER` | Деплой-пользователь | `lion` |
-| `SSH_PRIVATE_KEY` | Приватный ключ (deploy key на lion) | `-----BEGIN ...` |
-| `MAIL_DEPLOY_PATH` | Путь на lion | `/opt/wb-helper-mailserver` |
-| `MAIL_HOSTNAME` | FQDN MX | `mail.wb-helper.tech` |
-| `POSTMASTER_ADDRESS` | Постмастер | `postmaster@wb-helper.tech` |
-| `MAIL_BIND_IP` | IP для биндинга портов | `0.0.0.0` |
-| `SSL_TYPE` | Тип TLS | `letsencrypt` |
-
-### Первичная настройка сервера lion
-
-```bash
-# 1. Склонировать репо
-sudo mkdir -p /opt/wb-helper-mailserver
-sudo chown lion:lion /opt/wb-helper-mailserver
+# 4. Закоммитить публичные конфиги (postfix-accounts.cf — хеши, не plaintext)
 cd /opt/wb-helper-mailserver
-git clone git@github.com:<org>/wb-helper-mailserver.git .
-
-# 2. Certbot (см. выше)
-
-# 3. Первый пуш в main триггернёт деплой.
+git add config/postfix-accounts.cf
+git commit -m "ops: add postmaster account"
+git push origin main
 ```
 
-## Бэкап
+> **Безопасность.** Приватные DKIM-ключи (`config/opendkim/keys/**/*.private`) в публичный git **не пуши**. Если репо приватный — допустимо; иначе добавь их в `.gitignore` и держи только на сервере.
 
-Ежедневный tar-бэкап `./docker-data/` (письма + состояние) на внешнее хранилище — настраивается отдельно (см. `wb-helper-infra/README.md` для общего подхода к бэкапам).
+---
 
-## Проверка, что сервер «виден» миру
+## 5. Локальный запуск
 
 ```bash
-# MX/DNS
-dig +short MX wb-helper.tech
-dig +short mail.wb-helper.tech
-
-# SMTP-баннер с внешней машины
-nc -v mail.wb-helper.tech 25
-# → 220 mail.wb-helper.tech ESMTP
-
-# Репутация и настройки (spf/dkim/dmarc)
-# https://www.mail-tester.com/ — отправить тестовое письмо, посмотреть скор.
+cp .env.example .env   # заполнить MAIL_HOSTNAME, POSTMASTER_ADDRESS
+# Для локалки проще SSL_TYPE=self-signed
+docker compose up -d
+docker compose logs -f mailserver
 ```
+
+---
+
+## 6. Проверка работоспособности
+
+```bash
+# 1. Контейнер healthy?
+ssh -p 49154 deploy@<PUBLIC_IP> 'docker inspect -f "{{.State.Health.Status}}" wb-mailserver'
+
+# 2. SMTP-баннер с внешней машины
+nc -v mail.wb-helper.tech 25
+# → 220 mail.wb-helper.tech ESMTP Postfix
+
+# 3. Полный тест репутации
+# Отправить письмо на адрес с https://www.mail-tester.com → ожидаемый скор 10/10.
+
+# 4. Логи
+ssh -p 49154 deploy@<PUBLIC_IP> 'cd /opt/wb-helper-mailserver && docker compose logs --tail=200 mailserver'
+```
+
+---
+
+## 7. Бэкап
+
+`./docker-data/` (письма + состояние + конфиг) — критичная директория. Настрой ежедневный tar-снимок на внешнее хранилище. DKIM-ключи и `postfix-accounts.cf` — в первую очередь.
