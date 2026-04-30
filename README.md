@@ -2,7 +2,15 @@
 
 Почтовый сервер для домена `wb-helper.tech` на базе [docker-mailserver](https://github.com/docker-mailserver/docker-mailserver) (postfix + dovecot + rspamd/spamassassin + opendkim + fail2ban).
 
-Разворачивается **на сервере БД `192.168.1.10`** через **GitHub Actions**. Публичный доступ — без Apache reverse proxy: SMTP/IMAP — это не HTTP, порты 25/465/587/993 проброшены наружу напрямую.
+Разворачивается **на сервере БД `bison`** (внешний доступ `95.165.9.178:49153`) через **GitHub Actions**. Публичный доступ — без Apache reverse proxy `bouncer77` (он только для HTTP): SMTP/IMAP — это не HTTP, порты 25/465/587/993 проброшены с роутера напрямую на bison.
+
+### Карта инфраструктуры WB
+
+| Роль | Внутр. имя | Внешний доступ | Что крутится |
+|---|---|---|---|
+| Сервер приложений | `lion` (192.168.1.4) | `95.165.9.178:49154` | wb-backend, wb-helper-infra (Grafana/Prometheus/Loki) |
+| **Сервер БД** | `bison` | `95.165.9.178:49153` (user `bison`) | Postgres + **wb-helper-mailserver** |
+| Apache reverse proxy | `bouncer77` (192.168.1.7) | `:9811` (LAN) | `*.wb-helper.tech` HTTPS — почту **не** проксирует |
 
 ## Состав
 
@@ -84,42 +92,59 @@ dig +short -x <PUBLIC_IP>                     # → mail.wb-helper.tech. (PTR)
 
 | Имя | Значение / пример |
 |---|---|
-| `SSH_HOST` | `95.165.9.178` — внешний IP/хост (NAT-проброс на 192.168.1.10) |
-| `SSH_PORT` | `49154` — внешний порт, проброшен на `192.168.1.10:22` |
-| `SSH_USER` | `deploy` — деплой-пользователь на сервере БД |
-| `SSH_PRIVATE_KEY` | приватный ключ ed25519/rsa в PEM, **с переводами строк** |
+| `SSH_HOST` | `95.165.9.178` |
+| `SSH_PORT` | `49153` (NAT-проброс на bison:22) |
+| `SSH_USER` | `bison` (или отдельный `deploy`-пользователь на bison — см. ниже) |
+| `SSH_PRIVATE_KEY` | приватный ключ ed25519 в PEM, **с переводами строк** |
 | `MAIL_DEPLOY_PATH` | `/opt/wb-helper-mailserver` |
 | `MAIL_HOSTNAME` | `mail.wb-helper.tech` |
 | `POSTMASTER_ADDRESS` | `postmaster@wb-helper.tech` |
-| `MAIL_BIND_IP` | `0.0.0.0` (или конкретный публичный IP) |
+| `MAIL_BIND_IP` | `0.0.0.0` (или конкретный публичный IP, если у bison несколько интерфейсов) |
 | `SSL_TYPE` | `letsencrypt` |
+
+> Для `SSH_PORT` **49154 — это lion** (сервер приложений). Не путать. Для mailserver-деплоя — **49153** (bison).
 
 > GitHub Secrets корректно сохраняют многострочные значения — приватный ключ вставляй целиком, включая `-----BEGIN OPENSSH PRIVATE KEY-----` и `-----END OPENSSH PRIVATE KEY-----`.
 
-### Подготовка сервера БД (192.168.1.10) один раз
+### Подготовка сервера bison один раз
+
+Все команды выполняются с админ-машины. На bison ходим через `ssh -p 49153 bison@95.165.9.178` (пароль есть у владельца, в репо не коммитим).
 
 ```bash
+# === На локальной машине: сгенерировать deploy-ключ для CI ===
+ssh-keygen -t ed25519 -f ~/.ssh/wb-mailserver-deploy -N "" \
+  -C "github-actions@wb-helper-mailserver"
+
+# === На bison (sshd слушает 22 внутри, наружу проброшен 49153) ===
+ssh -p 49153 bison@95.165.9.178
+
 # 1. Деплой-пользователь и каталог
 sudo useradd -m -s /bin/bash deploy
 sudo usermod -aG docker deploy
 sudo mkdir -p /opt/wb-helper-mailserver
 sudo chown deploy:deploy /opt/wb-helper-mailserver
 
-# 2. SSH-ключ для CI (на машине разработчика)
-ssh-keygen -t ed25519 -f ~/.ssh/wb-mailserver-deploy -N ""
-ssh-copy-id -i ~/.ssh/wb-mailserver-deploy.pub -p 49154 deploy@<PUBLIC_IP>
-# Содержимое ~/.ssh/wb-mailserver-deploy → в GitHub Secret SSH_PRIVATE_KEY
+# 2. Положить публичный ключ
+sudo -u deploy mkdir -p /home/deploy/.ssh
+sudo -u deploy chmod 700 /home/deploy/.ssh
+# Вставить содержимое ~/.ssh/wb-mailserver-deploy.pub (с локальной машины):
+sudo -u deploy tee /home/deploy/.ssh/authorized_keys >/dev/null
+sudo -u deploy chmod 600 /home/deploy/.ssh/authorized_keys
 
-# 3. Клон репо в /opt
-sudo -u deploy git clone git@github.com:<org>/wb-helper-mailserver.git /opt/wb-helper-mailserver
+# 3. Клон репо в /opt (deploy-key/пуллер на github-стороне или https с PAT)
+sudo -u deploy git clone https://github.com/<org>/wb-helper-mailserver.git \
+  /opt/wb-helper-mailserver
 
 # 4. Certbot для TLS (см. раздел 3)
 sudo apt install -y certbot
 sudo certbot certonly --standalone -d mail.wb-helper.tech
 sudo systemctl enable --now certbot.timer
 
-# 5. Прокинуть на роутере TCP 25/465/587/993 на 192.168.1.10
+# 5. На роутере: проброс TCP 25/465/587/993 на bison (не на bouncer77 и не на lion).
+exit
 ```
+
+Содержимое `~/.ssh/wb-mailserver-deploy` (приватный ключ целиком, включая `-----BEGIN/END-----`) → в GitHub Secret `SSH_PRIVATE_KEY`. `SSH_USER=deploy`.
 
 После этого первый push в `main` (или ручной `workflow_dispatch`) развернёт сервис.
 
@@ -136,7 +161,7 @@ sudo systemctl enable --now certbot.timer
 ## 4. Первичная настройка после первого успешного деплоя
 
 ```bash
-ssh -p 49154 deploy@<PUBLIC_IP>
+ssh -p 49153 deploy@95.165.9.178      # bison
 cd /opt/wb-helper-mailserver
 
 # 1. Создать ящик postmaster
@@ -177,7 +202,7 @@ docker compose logs -f mailserver
 
 ```bash
 # 1. Контейнер healthy?
-ssh -p 49154 deploy@<PUBLIC_IP> 'docker inspect -f "{{.State.Health.Status}}" wb-mailserver'
+ssh -p 49153 deploy@95.165.9.178 'docker inspect -f "{{.State.Health.Status}}" wb-mailserver'
 
 # 2. SMTP-баннер с внешней машины
 nc -v mail.wb-helper.tech 25
@@ -187,7 +212,7 @@ nc -v mail.wb-helper.tech 25
 # Отправить письмо на адрес с https://www.mail-tester.com → ожидаемый скор 10/10.
 
 # 4. Логи
-ssh -p 49154 deploy@<PUBLIC_IP> 'cd /opt/wb-helper-mailserver && docker compose logs --tail=200 mailserver'
+ssh -p 49153 deploy@95.165.9.178 'cd /opt/wb-helper-mailserver && docker compose logs --tail=200 mailserver'
 ```
 
 ---
